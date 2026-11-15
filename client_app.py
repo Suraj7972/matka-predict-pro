@@ -218,7 +218,7 @@ def load_bt_data():
     with open(path) as f:
         return json.load(f)
 
-@st.cache_data(show_spinner="Loading strategy config…")
+@st.cache_data(show_spinner="Loading model config…")
 def load_configs():
     ma_path  = os.path.join(DATA_DIR, 'market_assign.json')
     nsr_path = os.path.join(DATA_DIR, 'newx_strategy_results.json')
@@ -600,14 +600,13 @@ def main():
 
     # ── Tab 1: Current Model ──
     with tab_cur:
-        st.caption("Current model: single strategy per market, jodi-optimised")
+        st.caption("Current model: Jodi-optimised predictions")
         rows_cur = []
         for mkt in mkt_list:
             p = preds[mkt]
             rows_cur.append({
                 'Market':     mkt,
                 'Session':    market_session_tag(mkt),
-                'Strategy':   p['cur_strat'],
                 'Open Top-4': "  ".join(str(d) for d in p['top4_op']),
                 'Close Top-4':"  ".join(str(d) for d in p['top4_cp']),
                 'Open Probs': "  ".join(f"{d}:{p['op_probs'][d]*100:.1f}%" for d in p['top4_op']),
@@ -626,7 +625,6 @@ def main():
                 op_bars = "  ".join(f"**{d}** ({p['op_probs'][d]*100:.1f}%)" for d in o4)
                 cp_bars = "  ".join(f"**{d}** ({p['cp_probs'][d]*100:.1f}%)" for d in c4)
                 with st.expander(f"{market_session_tag(mkt)} {mkt}  |  {p['h4_rate']*100:.1f}% hit"):
-                    st.markdown(f"**Strategy:** `{p['cur_strat']}`")
                     st.markdown(f"**Open Top-4:** {op_bars}")
                     st.markdown(f"**Close Top-4:** {cp_bars}")
                     # Mini probability chart
@@ -638,15 +636,13 @@ def main():
 
     # ── Tab 2: NX Model ──
     with tab_nx:
-        st.caption("NX model: separate best strategies for OPEN and CLOSE — higher accuracy")
+        st.caption("NX model: independent predictions for OPEN and CLOSE — higher accuracy")
         rows_nx = []
         for mkt in mkt_list:
             p = preds[mkt]
             rows_nx.append({
                 'Market':       mkt,
                 'Session':      market_session_tag(mkt),
-                'Open Strategy':p['nx_op_strat'],
-                'Close Strategy':p['nx_cp_strat'],
                 'Open Top-4':   "  ".join(str(d) for d in p['nx_top4_op']),
                 'Close Top-4':  "  ".join(str(d) for d in p['nx_top4_cp']),
                 'Open Probs':   "  ".join(f"{d}:{p['nx_op_probs'][d]*100:.1f}%" for d in p['nx_top4_op']),
@@ -665,8 +661,6 @@ def main():
                 op_bars = "  ".join(f"**{d}** ({p['nx_op_probs'][d]*100:.1f}%)" for d in o4)
                 cp_bars = "  ".join(f"**{d}** ({p['nx_cp_probs'][d]*100:.1f}%)" for d in c4)
                 with st.expander(f"{market_session_tag(mkt)} {mkt}  |  NX"):
-                    st.markdown(f"**Open Strategy:** `{p['nx_op_strat']}`")
-                    st.markdown(f"**Close Strategy:** `{p['nx_cp_strat']}`")
                     st.markdown(f"**Open Top-4:** {op_bars}")
                     st.markdown(f"**Close Top-4:** {cp_bars}")
                     chart_data2 = pd.DataFrame({
@@ -684,13 +678,10 @@ def main():
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("**Current Model**")
-                    st.markdown(f"Strategy: `{p['cur_strat']}`")
                     st.markdown(f"Open: **{'  '.join(str(d) for d in p['top4_op'])}**")
                     st.markdown(f"Close: **{'  '.join(str(d) for d in p['top4_cp'])}**")
                 with c2:
                     st.markdown("**NX Model**")
-                    st.markdown(f"Open strat: `{p['nx_op_strat']}`")
-                    st.markdown(f"Close strat: `{p['nx_cp_strat']}`")
                     st.markdown(f"Open: **{'  '.join(str(d) for d in p['nx_top4_op'])}**")
                     st.markdown(f"Close: **{'  '.join(str(d) for d in p['nx_top4_cp'])}**")
 
@@ -705,7 +696,7 @@ def main():
     # ── Footer ──
     st.markdown("---")
     st.caption(f"Matka Predict Pro v7 · Generated for {target_str} ({dow_name}) · "
-               f"{n_markets} active markets · 35-strategy engine")
+               f"{n_markets} active markets · Advanced AI/ML Prediction Engine")
 
 
 if __name__ == '__main__':
