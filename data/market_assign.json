@@ -1,0 +1,54 @@
+{
+  "Sridevi": {
+    "strategy": "Decay-1",
+    "t4_pct": 0.212
+  },
+  "TimeBazar": {
+    "strategy": "Mean-Revert-30",
+    "t4_pct": 0.20800000000000002
+  },
+  "MadhurDay": {
+    "strategy": "Anti-Last3",
+    "t4_pct": 0.195
+  },
+  "MilanDay": {
+    "strategy": "Decay-3",
+    "t4_pct": 0.20199999999999999
+  },
+  "RajdhaniDay": {
+    "strategy": "Markov-2",
+    "t4_pct": 0.192
+  },
+  "Kalyan": {
+    "strategy": "Decay-5",
+    "t4_pct": 0.20800000000000002
+  },
+  "SrideviNight": {
+    "strategy": "Recent-60",
+    "t4_pct": 0.195
+  },
+  "MadhurNight": {
+    "strategy": "Skip-Recent-5",
+    "t4_pct": 0.212
+  },
+  "SupremeNight": {
+    "strategy": "Balanced",
+    "t4_pct": 0.20600000000000002
+  },
+  "MilanNight": {
+    "strategy": "Anti-Freq-DOW-50",
+    "t4_pct": 0.187
+  },
+  "RajdhaniNight": {
+    "strategy": "Anti-Freq-DOW-50",
+    "t4_pct": 0.207
+  },
+  "KalyanNight": {
+    "strategy": "Decay-1",
+    "t4_pct": 0.233
+  },
+  "MainBazar": {
+    "strategy": "GeoAntiF-DOW",
+    "t4_pct": 0.196
+  }
+}
