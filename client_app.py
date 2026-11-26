@@ -6,11 +6,15 @@ Strategy names and methodology are NOT exposed in the UI.
 """
 
 import streamlit as st
-import json, os, io
+import json, os, io, base64
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 import numpy as np
 import pandas as pd
+try:
+    import requests as _requests
+except ImportError:
+    _requests = None
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -420,6 +424,125 @@ def compute_digit_freq(bt, days=30):
 
 
 # ─────────────────────────────────────────────────────────────
+# NX DEEP DIVE — walk-forward A vs B comparison
+# ─────────────────────────────────────────────────────────────
+def compute_nx_comparison(bt, ma, nsr, market, days=90):
+    """Run both models for the last `days` sessions of a market, compare hit rates."""
+    rows = bt.get(market, [])
+    if not rows or len(rows) < 15:
+        return []
+    recent = [r for r in rows if r.get('actual_op') is not None]
+    recent = recent[-min(days, len(recent)):]
+    result = []
+    for rec in recent:
+        ds = rec['date']
+        ops, cps, dows, n = _get_series(bt, market, ds)
+        if ops is None:
+            continue
+        tdow = datetime.strptime(ds, '%Y-%m-%d').weekday()
+        # Model A
+        cur_s = ma.get(market, {}).get('strategy', 'Hot-Cold')
+        if market == 'SupremeNight':
+            cur_s = 'Mean-Revert-30'
+        a_op_p, a_cp_p = _run_strat(cur_s, ops, cps, dows, tdow, n)
+        a_top4_op = list(map(int, np.argsort(a_op_p)[::-1][:4]))
+        a_top4_cp = list(map(int, np.argsort(a_cp_p)[::-1][:4]))
+        # Model B (NX) — same 60/40 blend as gen_predictions
+        cfg    = nsr.get(market, {})
+        bos    = cfg.get('best_open',  cur_s)
+        bcs    = cfg.get('best_close', cur_s)
+        bos2_l = cfg.get('top2_open',  [bos, bos])
+        bcs2_l = cfg.get('top2_close', [bcs, bcs])
+        bos2   = bos2_l[1] if len(bos2_l) > 1 else bos
+        bcs2   = bcs2_l[1] if len(bcs2_l) > 1 else bcs
+        try:    nx_op_p,  _ = _run_strat(bos,  ops, cps, dows, tdow, n)
+        except: nx_op_p     = np.ones(10)/10
+        try:    _,  nx_cp_p = _run_strat(bcs,  ops, cps, dows, tdow, n)
+        except: nx_cp_p     = np.ones(10)/10
+        try:    nx_op_p2, _ = _run_strat(bos2, ops, cps, dows, tdow, n)
+        except: nx_op_p2    = nx_op_p
+        try:    _, nx_cp_p2 = _run_strat(bcs2, ops, cps, dows, tdow, n)
+        except: nx_cp_p2    = nx_cp_p
+        nx_op_p = _norm(np.array(nx_op_p)*0.6 + np.array(nx_op_p2)*0.4)
+        nx_cp_p = _norm(np.array(nx_cp_p)*0.6 + np.array(nx_cp_p2)*0.4)
+        b_top4_op = list(map(int, np.argsort(nx_op_p)[::-1][:4]))
+        b_top4_cp = list(map(int, np.argsort(nx_cp_p)[::-1][:4]))
+        aop = rec.get('actual_op'); acp = rec.get('actual_cp')
+        result.append(dict(
+            date=ds, actual_op=aop, actual_cp=acp,
+            a_top4_op=a_top4_op, a_top4_cp=a_top4_cp,
+            b_top4_op=b_top4_op, b_top4_cp=b_top4_cp,
+            a_hit_op = aop in a_top4_op if aop is not None else None,
+            a_hit_cp = acp in a_top4_cp if acp is not None else None,
+            b_hit_op = aop in b_top4_op if aop is not None else None,
+            b_hit_cp = acp in b_top4_cp if acp is not None else None,
+        ))
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# RESULT ENTRY — add actual result + optional GitHub push
+# ─────────────────────────────────────────────────────────────
+def add_result_to_bt(bt, ma, nsr, mkt, date_str, actual_op, actual_cp):
+    """Append one actual result to the in-memory bt dict. Returns (new_bt, ok, msg)."""
+    existing = bt.get(mkt, [])
+    if any(r['date'] == date_str for r in existing):
+        return bt, False, f"Result for {date_str} already exists in {mkt}."
+    tdow  = datetime.strptime(date_str, '%Y-%m-%d').weekday()
+    preds = gen_predictions(bt, ma, nsr, date_str, tdow)
+    if mkt in preds:
+        p      = preds[mkt]
+        hit_op = actual_op in p['top4_op']
+        hit_cp = actual_cp in p['top4_cp']
+        hit4   = 1 if (hit_op or hit_cp) else 0
+        top4_op, top4_cp = p['top4_op'], p['top4_cp']
+    else:
+        hit4 = 0; top4_op = []; top4_cp = []
+    new_row = {
+        'date': date_str, 'actual_op': actual_op, 'actual_cp': actual_cp,
+        'actual_jodi': f"{actual_op}{actual_cp}",
+        'dow': tdow, 'hit4': hit4,
+        'top4_op': top4_op, 'top4_cp': top4_cp,
+    }
+    new_bt = {k: list(v) for k, v in bt.items()}
+    new_bt.setdefault(mkt, []).append(new_row)
+    new_bt[mkt] = sorted(new_bt[mkt], key=lambda r: r['date'])
+    hit_str = "✅ Hit" if hit4 else "❌ Miss"
+    return new_bt, True, f"Added {date_str} · {mkt} · Open:{actual_op} Close:{actual_cp} · {hit_str}"
+
+
+def push_bt_to_github(bt, token, repo="Suraj7972/matka-predict-pro",
+                      path="data/bt_data.json"):
+    """Push updated bt_data.json to the GitHub repo via the Contents API."""
+    if _requests is None:
+        return False, "requests library not available in this environment."
+    try:
+        hdrs = {'Authorization': f'token {token}',
+                'Accept': 'application/vnd.github.v3+json'}
+        r = _requests.get(
+            f'https://api.github.com/repos/{repo}/contents/{path}',
+            headers=hdrs, timeout=10)
+        if r.status_code != 200:
+            return False, f"GitHub {r.status_code}: {r.text[:300]}"
+        sha     = r.json()['sha']
+        content = base64.b64encode(
+            json.dumps(bt, ensure_ascii=False, indent=2).encode('utf-8')).decode()
+        payload = {
+            'message': f'Result entry via app [{datetime.now().strftime("%Y-%m-%d %H:%M")}]',
+            'content': content, 'sha': sha,
+        }
+        r2 = _requests.put(
+            f'https://api.github.com/repos/{repo}/contents/{path}',
+            headers=hdrs, json=payload, timeout=25)
+        ok = r2.status_code in (200, 201)
+        msg = ("Pushed to GitHub! App will refresh in ~2 min."
+               if ok else f"Push failed {r2.status_code}: {r2.text[:200]}")
+        return ok, msg
+    except Exception as e:
+        return False, str(e)
+
+
+# ─────────────────────────────────────────────────────────────
 # EXCEL PARSER
 # ─────────────────────────────────────────────────────────────
 def _panna_to_digit(v):
@@ -647,12 +770,14 @@ def main():
     st.markdown("---")
 
     # ── MAIN TABS ───────────────────────────────────────────────
-    tab_pred, tab_bt, tab_perf, tab_jodi, tab_upd = st.tabs([
+    tab_pred, tab_bt, tab_perf, tab_jodi, tab_upd, tab_nx, tab_entry = st.tabs([
         "📋 All Predictions",
         "📅 Backtest Explorer",
         "📊 Performance",
         "🎲 Jodi Analysis",
         "📥 Data Update",
+        "🔬 NX Deep Dive",
+        "✏️ Enter Results",
     ])
 
     # ════════════════════════════════════════════════════════════
@@ -1121,6 +1246,258 @@ This file is updated periodically by the data administrator.
             "📌 **For the administrator:** Replace `data/bt_data.json` in the GitHub repo weekly "
             "with the latest export. The app will pick it up automatically within 2 minutes of the push."
         )
+
+    # ════════════════════════════════════════════════════════════
+    # TAB 6 — NX DEEP DIVE
+    # ════════════════════════════════════════════════════════════
+    with tab_nx:
+        st.markdown("### 🔬 NX Deep Dive — Model A vs Model B")
+        st.caption(
+            "Walk-forward comparison on historical sessions. "
+            "Only data before each session date is used — same logic as live predictions."
+        )
+
+        col_nx1, col_nx2, col_nx3 = st.columns([3, 2, 1])
+        with col_nx1:
+            nx_market = st.selectbox("Select Market", ALL_MKT, key='nx_mkt_sel')
+        with col_nx2:
+            nx_days = st.selectbox("Look-back Window", [30, 60, 90, 120], index=1, key='nx_days_sel')
+        with col_nx3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            run_nx = st.button("▶ Run", use_container_width=True, key='nx_run_btn')
+
+        nx_cache_key = f'nx_{nx_market}_{nx_days}'
+        if run_nx or nx_cache_key not in st.session_state:
+            with st.spinner(f"Computing {nx_days} sessions for {nx_market}…"):
+                st.session_state[nx_cache_key] = compute_nx_comparison(
+                    bt, ma, nsr, nx_market, nx_days)
+
+        nx_rows = st.session_state.get(nx_cache_key, [])
+
+        if not nx_rows:
+            st.info("No data yet — click ▶ Run to compute.")
+        else:
+            has_act = [r for r in nx_rows if r['actual_op'] is not None]
+            n_nx    = len(has_act)
+
+            a_op_h = sum(1 for r in has_act if r['a_hit_op'])
+            a_cp_h = sum(1 for r in has_act if r['a_hit_cp'])
+            b_op_h = sum(1 for r in has_act if r['b_hit_op'])
+            b_cp_h = sum(1 for r in has_act if r['b_hit_cp'])
+            a_any  = sum(1 for r in has_act if r['a_hit_op'] or r['a_hit_cp'])
+            b_any  = sum(1 for r in has_act if r['b_hit_op'] or r['b_hit_cp'])
+            both_h = sum(1 for r in has_act if (r['a_hit_op'] or r['a_hit_cp'])
+                         and (r['b_hit_op'] or r['b_hit_cp']))
+            a_only = sum(1 for r in has_act if (r['a_hit_op'] or r['a_hit_cp'])
+                         and not (r['b_hit_op'] or r['b_hit_cp']))
+            b_only = sum(1 for r in has_act if not (r['a_hit_op'] or r['a_hit_cp'])
+                         and (r['b_hit_op'] or r['b_hit_cp']))
+            both_m = n_nx - a_any - b_only
+
+            st.markdown(f"#### {nx_market} — last {len(nx_rows)} sessions ({n_nx} with actuals)")
+
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("Model A hit rate", f"{a_any/n_nx*100:.1f}%" if n_nx else "—")
+            mc2.metric("Model B hit rate", f"{b_any/n_nx*100:.1f}%" if n_nx else "—")
+            mc3.metric("B wins (A missed)", b_only)
+            mc4.metric("A wins (B missed)", a_only)
+            mc5.metric("Both hit / miss",   f"{both_h} / {both_m}")
+
+            if n_nx > 0:
+                diff = (b_any - a_any) / n_nx * 100
+                if abs(diff) < 1.5:
+                    st.info("🟡 Models are **about equal** on this market over this window.")
+                elif diff > 0:
+                    st.success(f"🟢 **Model B leads** Model A by {diff:+.1f}pp on this market.")
+                else:
+                    st.info(f"🔵 **Model A leads** Model B by {-diff:+.1f}pp on this market.")
+
+            # Open & Close breakdown
+            st.markdown("#### Open & Close Accuracy")
+            oc4 = st.columns(4)
+            oc4[0].metric("A — Open",  f"{a_op_h/n_nx*100:.1f}%" if n_nx else "—")
+            oc4[1].metric("A — Close", f"{a_cp_h/n_nx*100:.1f}%" if n_nx else "—")
+            oc4[2].metric("B — Open",  f"{b_op_h/n_nx*100:.1f}%" if n_nx else "—")
+            oc4[3].metric("B — Close", f"{b_cp_h/n_nx*100:.1f}%" if n_nx else "—")
+
+            # Cumulative hit rate chart
+            st.markdown("#### Cumulative Hit Rate Over Time")
+            cum_a, cum_b, cum_dates = [], [], []
+            run_a = run_b = 0
+            for idx, r in enumerate(nx_rows):
+                if r['actual_op'] is None: continue
+                run_a += 1 if (r['a_hit_op'] or r['a_hit_cp']) else 0
+                run_b += 1 if (r['b_hit_op'] or r['b_hit_cp']) else 0
+                n_so_far = idx + 1
+                cum_a.append(run_a / n_so_far * 100)
+                cum_b.append(run_b / n_so_far * 100)
+                cum_dates.append(r['date'])
+            if cum_dates:
+                df_cum = pd.DataFrame(
+                    {'Model A %': cum_a, 'Model B %': cum_b}, index=cum_dates)
+                st.line_chart(df_cum, height=240)
+
+            # Session-by-session table (last 30)
+            st.markdown("#### Last 30 Sessions — Detail")
+            tbl_nx = []
+            for r in reversed(nx_rows[-30:]):
+                aop = r['actual_op'] if r['actual_op'] is not None else '?'
+                acp = r['actual_cp'] if r['actual_cp'] is not None else '?'
+                tbl_nx.append({
+                    'Date'       : r['date'],
+                    'Actual O/C' : f"{aop}/{acp}",
+                    'A — Open'   : _d4(r['a_top4_op']),
+                    'A — Close'  : _d4(r['a_top4_cp']),
+                    'A hit O/C'  : _hit_icon(r['a_hit_op']) + '/' + _hit_icon(r['a_hit_cp']),
+                    'B — Open'   : _d4(r['b_top4_op']),
+                    'B — Close'  : _d4(r['b_top4_cp']),
+                    'B hit O/C'  : _hit_icon(r['b_hit_op']) + '/' + _hit_icon(r['b_hit_cp']),
+                })
+            st.dataframe(pd.DataFrame(tbl_nx), use_container_width=True, hide_index=True)
+
+    # ════════════════════════════════════════════════════════════
+    # TAB 7 — ENTER RESULTS
+    # ════════════════════════════════════════════════════════════
+    with tab_entry:
+        st.markdown("### ✏️ Enter Actual Results")
+        st.caption(
+            "Add today's or any past market result. The app computes the prediction "
+            "it would have made for that date and records whether it was a hit."
+        )
+
+        # Detect GitHub credentials from Streamlit secrets
+        gh_token = None
+        gh_repo  = "Suraj7972/matka-predict-pro"
+        try:
+            gh_token = st.secrets.get("GITHUB_TOKEN", None)
+            gh_repo  = st.secrets.get("GITHUB_REPO", gh_repo)
+        except Exception:
+            pass
+
+        if gh_token:
+            st.success("🔗 GitHub connected — results will auto-push to repo on submit.")
+        else:
+            st.warning(
+                "GitHub token not configured. Results saved for this session only. "
+                "Add `GITHUB_TOKEN` to Streamlit secrets for permanent storage — see ℹ️ below."
+            )
+
+        # --- Result entry form ---
+        with st.form("result_entry_form", clear_on_submit=False):
+            fe1, fe2, fe3, fe4 = st.columns([3, 2, 1, 1])
+            with fe1:
+                entry_mkt  = st.selectbox("Market", ALL_MKT, key='entry_mkt_sel')
+            with fe2:
+                entry_date = st.date_input(
+                    "Date",
+                    value=date.today() - timedelta(1),
+                    max_value=date.today(),
+                    min_value=date(2025, 1, 1),
+                    key='entry_date_pick',
+                )
+            with fe3:
+                entry_op = st.selectbox("Open digit", list(range(10)), key='entry_op_sel')
+            with fe4:
+                entry_cp = st.selectbox("Close digit", list(range(10)), key='entry_cp_sel')
+            submitted = st.form_submit_button("✅ Submit Result", use_container_width=True)
+
+        if submitted:
+            entry_date_str = entry_date.strftime('%Y-%m-%d')
+            with st.spinner("Computing prediction hit…"):
+                new_bt, ok, msg = add_result_to_bt(
+                    bt, ma, nsr, entry_mkt, entry_date_str, entry_op, entry_cp)
+            if not ok:
+                st.error(msg)
+            else:
+                st.success(msg)
+                # Attempt GitHub push if token available
+                if gh_token:
+                    with st.spinner("Pushing to GitHub…"):
+                        pushed, push_msg = push_bt_to_github(new_bt, gh_token, gh_repo)
+                    if pushed:
+                        st.success(f"🚀 {push_msg}")
+                        st.cache_data.clear()
+                    else:
+                        st.error(f"GitHub push failed: {push_msg}")
+                        st.download_button(
+                            "⬇️ Download updated bt_data.json (push manually)",
+                            data=json.dumps(new_bt, indent=2, ensure_ascii=False),
+                            file_name="bt_data.json", mime="application/json",
+                            key='dl_bt_fallback',
+                        )
+                else:
+                    st.session_state['entry_bt'] = new_bt
+                    st.download_button(
+                        "⬇️ Download updated bt_data.json (push to GitHub manually)",
+                        data=json.dumps(new_bt, indent=2, ensure_ascii=False),
+                        file_name="bt_data.json", mime="application/json",
+                        key='dl_bt_session',
+                    )
+
+        # --- Recent records for selected market ---
+        st.markdown("#### Recent Database Records")
+        entry_mkt_view = st.session_state.get('entry_mkt_sel', ALL_MKT[0])
+        mkt_rows = bt.get(entry_mkt_view, [])
+        if mkt_rows:
+            last_n = mkt_rows[-10:][::-1]
+            rec_tbl = []
+            for r in last_n:
+                t4o  = r.get('top4_op', [])
+                t4c  = r.get('top4_cp', [])
+                hit_o = r.get('actual_op') in t4o if t4o else None
+                hit_c = r.get('actual_cp') in t4c if t4c else None
+                rec_tbl.append({
+                    'Date'  : r['date'],
+                    'Open'  : r.get('actual_op', '?'),
+                    'Close' : r.get('actual_cp', '?'),
+                    'Pred O': _d4(t4o) if t4o else '—',
+                    'Pred C': _d4(t4c) if t4c else '—',
+                    'Hit O' : _hit_icon(hit_o),
+                    'Hit C' : _hit_icon(hit_c),
+                    'hit4'  : '✅' if r.get('hit4') else '❌',
+                })
+            st.markdown(f"**{entry_mkt_view}** — last {len(last_n)} records")
+            st.dataframe(pd.DataFrame(rec_tbl), use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No records yet for {entry_mkt_view}.")
+
+        # --- Setup instructions ---
+        with st.expander("ℹ️ Setup — GitHub token for permanent storage"):
+            st.markdown("""
+**To make result entries permanently saved (auto-push to GitHub):**
+
+1. Create a GitHub Personal Access Token:
+   - Go to GitHub → Settings → Developer Settings → Personal Access Tokens → Fine-grained tokens
+   - Scope: **Contents (Read & Write)** on the `matka-predict-pro` repository
+   - Copy the token
+
+2. Add it to Streamlit Cloud secrets:
+   - Streamlit Cloud dashboard → App → Settings → Secrets
+   - Add these lines:
+   ```toml
+   GITHUB_TOKEN = "ghp_your_token_here"
+   GITHUB_REPO  = "Suraj7972/matka-predict-pro"
+   ```
+
+3. Save and redeploy — the app will now auto-push every new result to GitHub permanently.
+
+**Without the token:** Use the ⬇️ Download button after submitting, then push `bt_data.json`
+to `data/bt_data.json` in GitHub manually. The app refreshes within 2 minutes.
+""")
+
+        with st.expander("📊 Bulk entry — use Excel upload in sidebar"):
+            st.markdown("""
+For adding many results at once, use the **Excel uploader in the sidebar**:
+
+| Column | Required | Format |
+|--------|----------|--------|
+| Date | Yes | YYYY-MM-DD |
+| Market | Optional | Exact market name |
+| Open | Yes | 0–9 or 3-digit panna |
+| Close | Yes | 0–9 or 3-digit panna |
+
+After uploading, download the updated bt_data.json and push to GitHub to make permanent.
+""")
 
     # ── FOOTER ──────────────────────────────────────────────────
     st.markdown("---")
